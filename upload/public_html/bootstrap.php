@@ -43,11 +43,12 @@ function migrate_database(PDO $pdo): void
 {
     $pdo->exec(
         'CREATE TABLE IF NOT EXISTS schema_migrations (
-            version VARCHAR(32) NOT NULL,
+            version VARCHAR(96) NOT NULL,
             applied_at DATETIME NOT NULL,
             PRIMARY KEY (version)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci'
     );
+    $pdo->exec('ALTER TABLE schema_migrations MODIFY version VARCHAR(96) NOT NULL');
 
     $migrations = [
         '202605280001_create_views' => [
@@ -109,6 +110,23 @@ function migrate_database(PDO $pdo): void
     $applied = $pdo
         ->query('SELECT version FROM schema_migrations')
         ->fetchAll(PDO::FETCH_COLUMN);
+
+    $legacyCrawlerVersion = '202606240001_create_crawler_tabl';
+    $crawlerVersion = '202606240001_create_crawler_tables';
+    if (in_array($legacyCrawlerVersion, $applied, true) && !in_array($crawlerVersion, $applied, true)) {
+        $stmt = $pdo->prepare('UPDATE schema_migrations SET version = :new_version WHERE version = :old_version');
+        $stmt->execute([
+            'new_version' => $crawlerVersion,
+            'old_version' => $legacyCrawlerVersion,
+        ]);
+        $applied = array_map(
+            function (string $version) use ($legacyCrawlerVersion, $crawlerVersion): string {
+                return $version === $legacyCrawlerVersion ? $crawlerVersion : $version;
+            },
+            $applied
+        );
+    }
+
     $applied = array_flip($applied);
 
     foreach ($migrations as $version => $statements) {
@@ -121,7 +139,7 @@ function migrate_database(PDO $pdo): void
         }
 
         $stmt = $pdo->prepare(
-            'INSERT INTO schema_migrations (version, applied_at) VALUES (:version, NOW())'
+            'INSERT IGNORE INTO schema_migrations (version, applied_at) VALUES (:version, NOW())'
         );
         $stmt->execute(['version' => $version]);
     }

@@ -10,6 +10,7 @@ const apiToken = process.env.CRAWLER_API_TOKEN || "";
 const publicBaseUrl = (process.env.PUBLIC_BASE_URL || "").replace(/\/$/, "");
 const artifactsDir = path.resolve("artifacts");
 const jobs = new Map();
+const jobTimeoutMs = Number(process.env.CRAWLER_JOB_TIMEOUT_MS || 20 * 60 * 1000);
 
 app.use(express.json({ limit: "2mb" }));
 app.use("/artifacts", express.static(artifactsDir));
@@ -28,7 +29,7 @@ app.post("/jobs", requireToken, async (req, res) => {
   jobs.set(workerJobId, { status: "queued", site: payload.site?.name || "unknown", createdAt: new Date().toISOString() });
   res.status(202).json({ ok: true, workerJobId });
 
-  runJob(workerJobId, payload).catch(async (error) => {
+  runJobWithTimeout(workerJobId, payload).catch(async (error) => {
     jobs.set(workerJobId, { status: "failed", error: String(error?.stack || error) });
     await postCallback(payload, { status: "failed", error: String(error?.message || error) });
   });
@@ -50,6 +51,27 @@ function requireToken(req, res, next) {
     return res.status(401).json({ ok: false, error: "Unauthorized" });
   }
   next();
+}
+
+async function runJobWithTimeout(workerJobId, payload) {
+  let timeoutId;
+  const timeout = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      jobs.set(workerJobId, {
+        status: "timed_out",
+        site: payload.site?.name || "unknown",
+        error: `Worker timeout after ${Math.round(jobTimeoutMs / 60000)} minutes`,
+        finishedAt: new Date().toISOString()
+      });
+      reject(new Error(`Worker timeout after ${Math.round(jobTimeoutMs / 60000)} minutes`));
+    }, jobTimeoutMs);
+  });
+
+  try {
+    await Promise.race([runJob(workerJobId, payload), timeout]);
+  } finally {
+    clearTimeout(timeoutId);
+  }
 }
 
 async function runJob(workerJobId, payload) {
@@ -141,6 +163,11 @@ async function runJob(workerJobId, payload) {
   const resultPath = path.join(jobDir, "result.json");
   await fs.writeFile(resultPath, JSON.stringify({ summary, script, steps, videoUrl, aiAnalysis }, null, 2), "utf8");
 
+  const current = jobs.get(workerJobId);
+  if (current && current.status !== "running") {
+    return;
+  }
+
   jobs.set(workerJobId, { status: "completed", site: payload.site.name, finishedAt: new Date().toISOString(), pages: visited.size, videoUrl });
   await postCallback(payload, { status: "completed", summary, script, videoUrl, artifactUrl: artifactUrl(payload.jobId, "result.json"), aiAnalysis });
 }
@@ -220,7 +247,8 @@ async function postCallback(payload, result) {
       "Content-Type": "application/json",
       "X-Crawler-Callback-Token": payload.callbackToken
     },
-    body: JSON.stringify({ jobId: payload.jobId, ...result })
+    body: JSON.stringify({ jobId: payload.jobId, ...result }),
+    signal: timeoutSignal(30000)
   }).catch((error) => console.error("callback failed", error));
 }
 
@@ -304,7 +332,8 @@ async function analyzeSiteWithOpenAI(payload, steps, summary) {
       model,
       input: prompt,
       text: { format: { type: "json_object" } }
-    })
+    }),
+    signal: timeoutSignal(120000)
   });
 
   const body = await response.text();
@@ -363,7 +392,8 @@ async function synthesizeVoiceover(payload, aiAnalysis, jobDir) {
       voice: "alloy",
       input: voiceover.slice(0, 4000),
       response_format: "mp3"
-    })
+    }),
+    signal: timeoutSignal(120000)
   });
 
   if (!response.ok) {
@@ -418,6 +448,13 @@ async function findNewestVideo(dir) {
 function clamp(value, min, max) {
   if (!Number.isFinite(value)) return min;
   return Math.max(min, Math.min(max, value));
+}
+
+function timeoutSignal(ms) {
+  if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
+    return AbortSignal.timeout(ms);
+  }
+  return undefined;
 }
 
 app.listen(port, () => {

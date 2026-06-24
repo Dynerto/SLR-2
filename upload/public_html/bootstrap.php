@@ -105,6 +105,64 @@ function migrate_database(PDO $pdo): void
                 CONSTRAINT fk_crawl_jobs_site FOREIGN KEY (site_id) REFERENCES crawl_sites(id) ON DELETE CASCADE
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci',
         ],
+        '202606240002_create_ai_tables' => [
+            'CREATE TABLE IF NOT EXISTS ai_settings (
+                id TINYINT UNSIGNED NOT NULL,
+                api_key_encrypted TEXT NULL,
+                selected_model VARCHAR(120) NOT NULL DEFAULT "gpt-5.4-nano",
+                available_models MEDIUMTEXT NULL,
+                updated_at DATETIME NOT NULL,
+                PRIMARY KEY (id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci',
+            'INSERT IGNORE INTO ai_settings (id, selected_model, updated_at) VALUES (1, "gpt-5.4-nano", NOW())',
+            'CREATE TABLE IF NOT EXISTS crawl_discovered_workflows (
+                id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                job_id BIGINT UNSIGNED NOT NULL,
+                site_id BIGINT UNSIGNED NOT NULL,
+                title VARCHAR(255) NOT NULL,
+                user_goal TEXT NULL,
+                steps_json MEDIUMTEXT NULL,
+                evidence_json MEDIUMTEXT NULL,
+                confidence DECIMAL(4,3) NULL,
+                created_at DATETIME NOT NULL,
+                PRIMARY KEY (id),
+                INDEX idx_crawl_workflows_job_id (job_id),
+                INDEX idx_crawl_workflows_site_id (site_id),
+                CONSTRAINT fk_crawl_workflows_job FOREIGN KEY (job_id) REFERENCES crawl_jobs(id) ON DELETE CASCADE,
+                CONSTRAINT fk_crawl_workflows_site FOREIGN KEY (site_id) REFERENCES crawl_sites(id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci',
+            'CREATE TABLE IF NOT EXISTS crawl_usage_goals (
+                id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                job_id BIGINT UNSIGNED NOT NULL,
+                site_id BIGINT UNSIGNED NOT NULL,
+                title VARCHAR(255) NOT NULL,
+                audience VARCHAR(255) NULL,
+                priority VARCHAR(40) NULL,
+                evidence_json MEDIUMTEXT NULL,
+                created_at DATETIME NOT NULL,
+                PRIMARY KEY (id),
+                INDEX idx_crawl_goals_job_id (job_id),
+                INDEX idx_crawl_goals_site_id (site_id),
+                CONSTRAINT fk_crawl_goals_job FOREIGN KEY (job_id) REFERENCES crawl_jobs(id) ON DELETE CASCADE,
+                CONSTRAINT fk_crawl_goals_site FOREIGN KEY (site_id) REFERENCES crawl_sites(id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci',
+            'CREATE TABLE IF NOT EXISTS crawl_ai_insights (
+                id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                job_id BIGINT UNSIGNED NOT NULL,
+                site_id BIGINT UNSIGNED NOT NULL,
+                insight_type VARCHAR(60) NOT NULL,
+                title VARCHAR(255) NOT NULL,
+                body MEDIUMTEXT NULL,
+                evidence_json MEDIUMTEXT NULL,
+                created_at DATETIME NOT NULL,
+                PRIMARY KEY (id),
+                INDEX idx_crawl_insights_job_id (job_id),
+                INDEX idx_crawl_insights_site_id (site_id),
+                INDEX idx_crawl_insights_type (insight_type),
+                CONSTRAINT fk_crawl_insights_job FOREIGN KEY (job_id) REFERENCES crawl_jobs(id) ON DELETE CASCADE,
+                CONSTRAINT fk_crawl_insights_site FOREIGN KEY (site_id) REFERENCES crawl_sites(id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci',
+        ],
     ];
 
     $applied = $pdo
@@ -225,6 +283,32 @@ function decrypt_secret(string $encrypted): string
     $plain = openssl_decrypt($cipher, 'aes-256-cbc', $key, OPENSSL_RAW_DATA, $iv);
 
     return $plain === false ? '' : $plain;
+}
+
+function ai_settings(): array
+{
+    $stmt = db()->query('SELECT * FROM ai_settings WHERE id = 1');
+    $settings = $stmt->fetch();
+
+    if (!$settings) {
+        db()->exec('INSERT IGNORE INTO ai_settings (id, selected_model, updated_at) VALUES (1, "gpt-5.4-nano", NOW())');
+        $stmt = db()->query('SELECT * FROM ai_settings WHERE id = 1');
+        $settings = $stmt->fetch() ?: [];
+    }
+
+    $models = [];
+    if (!empty($settings['available_models'])) {
+        $decoded = json_decode((string) $settings['available_models'], true);
+        $models = is_array($decoded) ? array_values(array_filter(array_map('strval', $decoded))) : [];
+    }
+
+    return [
+        'api_key_encrypted' => (string) ($settings['api_key_encrypted'] ?? ''),
+        'api_key' => !empty($settings['api_key_encrypted']) ? decrypt_secret((string) $settings['api_key_encrypted']) : '',
+        'selected_model' => (string) ($settings['selected_model'] ?? 'gpt-5.4-nano'),
+        'available_models' => $models,
+        'updated_at' => (string) ($settings['updated_at'] ?? ''),
+    ];
 }
 
 function json_response(array $payload, int $status = 200): void

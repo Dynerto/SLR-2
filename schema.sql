@@ -1,5 +1,5 @@
 CREATE TABLE schema_migrations (
-  version VARCHAR(32) NOT NULL,
+  version VARCHAR(96) NOT NULL,
   applied_at DATETIME NOT NULL,
   PRIMARY KEY (version)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

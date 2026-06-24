@@ -66,7 +66,7 @@ if (isset($_GET['saved']) && $_GET['saved'] === 'models') {
 
 $sites = [];
 $jobs = [];
-$aiSettings = ['api_key' => '', 'selected_model' => 'gpt-5.4-nano', 'available_models' => []];
+$aiSettings = ['api_key' => '', 'api_key_source' => '', 'selected_model' => 'gpt-5.4-nano', 'available_models' => []];
 $workflowCount = 0;
 $goalCount = 0;
 $insightCount = 0;
@@ -360,7 +360,7 @@ function site_origin(): string
           <form class="video-form" method="post" action="/admin/crawls/">
             <input type="hidden" name="csrf_token" value="<?= e($_SESSION['csrf_token']) ?>">
             <div class="form-grid">
-              <label>OpenAI API key <input type="password" name="openai_api_key" placeholder="<?= $aiSettings['api_key'] !== '' ? 'Key is opgeslagen' : 'sk-...' ?>"></label>
+              <label>OpenAI API key <input type="password" name="openai_api_key" placeholder="<?= $aiSettings['api_key'] !== '' ? ($aiSettings['api_key_source'] === 'env' ? 'Key komt uit .env' : 'Key is opgeslagen') : 'sk-...' ?>"></label>
               <label>Model
                 <select name="selected_model">
                   <?php
@@ -378,7 +378,7 @@ function site_origin(): string
             </div>
           </form>
           <p class="video-status">
-            AI <?= $aiSettings['api_key'] !== '' ? 'staat aan' : 'staat nog uit' ?>.
+            AI <?= $aiSettings['api_key'] !== '' ? 'staat aan' : 'staat nog uit' ?><?= $aiSettings['api_key_source'] === 'env' ? ' via .env' : '' ?>.
             Gekozen model: <?= e($aiSettings['selected_model'] ?: 'gpt-5.4-nano') ?>.
             Opgeslagen: <?= (int) $workflowCount ?> workflows, <?= (int) $goalCount ?> gebruiksdoelen, <?= (int) $insightCount ?> inzichten.
           </p>

@@ -85,7 +85,16 @@ async function runJob(workerJobId, payload) {
       const pageInfo = await inspectPage(page);
       const screenshotName = `${String(visited.size).padStart(3, "0")}.png`;
       await page.screenshot({ path: path.join(jobDir, screenshotName), fullPage: true }).catch(() => {});
-      steps.push({ type: "page", url, title: pageInfo.title, screenshot: artifactUrl(payload.jobId, screenshotName), buttons: pageInfo.buttons, forms: pageInfo.forms });
+      steps.push({
+        type: "page",
+        url,
+        title: pageInfo.title,
+        headings: pageInfo.headings,
+        screenshot: artifactUrl(payload.jobId, screenshotName),
+        buttons: pageInfo.buttons,
+        forms: pageInfo.forms,
+        textSample: pageInfo.textSample
+      });
 
       for (const link of pageInfo.links) {
         const absolute = safeUrl(link, url);
@@ -105,11 +114,20 @@ async function runJob(workerJobId, payload) {
   const videoUrl = videoPath ? artifactUrl(payload.jobId, path.basename(videoPath)) : "";
   const script = buildInstructionScript(payload, steps);
   const summary = buildSummary(payload, steps, visited.size, allowPurchases);
+  const aiAnalysis = await analyzeSiteWithOpenAI(payload, steps, summary).catch((error) => ({
+    error: String(error?.message || error),
+    workflows: [],
+    usage_goals: [],
+    features: [],
+    optimizations: [],
+    risks: [],
+    content_suggestions: []
+  }));
   const resultPath = path.join(jobDir, "result.json");
-  await fs.writeFile(resultPath, JSON.stringify({ summary, script, steps, videoUrl }, null, 2), "utf8");
+  await fs.writeFile(resultPath, JSON.stringify({ summary, script, steps, videoUrl, aiAnalysis }, null, 2), "utf8");
 
   jobs.set(workerJobId, { status: "completed", site: payload.site.name, finishedAt: new Date().toISOString(), pages: visited.size, videoUrl });
-  await postCallback(payload, { status: "completed", summary, script, videoUrl, artifactUrl: artifactUrl(payload.jobId, "result.json") });
+  await postCallback(payload, { status: "completed", summary, script, videoUrl, artifactUrl: artifactUrl(payload.jobId, "result.json"), aiAnalysis });
 }
 
 async function login(page, site, steps) {
@@ -136,12 +154,14 @@ async function inspectPage(page) {
     const visibleText = (el) => (el.innerText || el.textContent || "").trim().replace(/\s+/g, " ").slice(0, 120);
     return {
       title: document.title || "",
+      headings: Array.from(document.querySelectorAll("h1, h2, h3")).map(visibleText).filter(Boolean).slice(0, 40),
       links: Array.from(document.querySelectorAll("a[href]")).map((a) => a.href).filter(Boolean).slice(0, 80),
       buttons: Array.from(document.querySelectorAll("button, [role=button], input[type=submit]")).map(visibleText).filter(Boolean).slice(0, 40),
       forms: Array.from(document.querySelectorAll("form")).map((form) => ({
         action: form.action || location.href,
         labels: Array.from(form.querySelectorAll("label, input, select, textarea")).map((el) => el.getAttribute("aria-label") || el.getAttribute("name") || visibleText(el)).filter(Boolean).slice(0, 30)
-      })).slice(0, 10)
+      })).slice(0, 10),
+      textSample: visibleText(document.body).slice(0, 1200)
     };
   });
 }
@@ -191,6 +211,97 @@ function buildInstructionScript(payload, steps) {
     }
   }
   return lines.join("\n");
+}
+
+async function analyzeSiteWithOpenAI(payload, steps, summary) {
+  const apiKey = String(payload.ai?.apiKey || "").trim();
+  const model = String(payload.ai?.model || "gpt-5.4-nano").trim() || "gpt-5.4-nano";
+  if (!apiKey) {
+    return {
+      error: "OpenAI API key not configured",
+      workflows: [],
+      usage_goals: [],
+      features: [],
+      optimizations: [],
+      risks: [],
+      content_suggestions: []
+    };
+  }
+
+  const observations = steps
+    .filter((step) => step.type === "page")
+    .slice(0, 30)
+    .map((step) => ({
+      url: step.url,
+      title: step.title,
+      headings: step.headings || [],
+      buttons: step.buttons || [],
+      forms: step.forms || [],
+      screenshot: step.screenshot || "",
+      textSample: step.textSample || ""
+    }));
+
+  const prompt = [
+    "Analyseer deze software-crawl alsof je een product onboarding specialist bent.",
+    "Ontdek workflows, gebruiksdoelen, belangrijke functies, optimalisaties, risico's en suggesties voor instructievideo's.",
+    "Gebruik Nederlands. Wees concreet en baseer elk item op evidence uit urls, knoppen, formulieren of headings.",
+    "Geef uitsluitend geldige JSON terug met exact deze top-level keys:",
+    "workflows, usage_goals, features, optimizations, risks, content_suggestions.",
+    "workflow object: title, user_goal, steps array, evidence array, confidence number 0..1.",
+    "usage_goals object: title, audience, priority, evidence array.",
+    "feature/optimization/risk/content_suggestion object: title, body, evidence array.",
+    "",
+    JSON.stringify({
+      site: payload.site?.name || "site",
+      objective: payload.job?.objective || "",
+      summary,
+      observations
+    })
+  ].join("\n");
+
+  const response = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${apiKey}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model,
+      input: prompt,
+      text: { format: { type: "json_object" } }
+    })
+  });
+
+  const body = await response.text();
+  if (!response.ok) {
+    throw new Error(`OpenAI analysis failed ${response.status}: ${body}`);
+  }
+
+  const data = JSON.parse(body);
+  const outputText = extractResponseText(data);
+  if (!outputText) {
+    throw new Error("OpenAI response did not contain text output");
+  }
+
+  const parsed = JSON.parse(outputText);
+  return {
+    workflows: Array.isArray(parsed.workflows) ? parsed.workflows : [],
+    usage_goals: Array.isArray(parsed.usage_goals) ? parsed.usage_goals : [],
+    features: Array.isArray(parsed.features) ? parsed.features : [],
+    optimizations: Array.isArray(parsed.optimizations) ? parsed.optimizations : [],
+    risks: Array.isArray(parsed.risks) ? parsed.risks : [],
+    content_suggestions: Array.isArray(parsed.content_suggestions) ? parsed.content_suggestions : []
+  };
+}
+
+function extractResponseText(data) {
+  if (typeof data.output_text === "string") return data.output_text;
+  for (const item of data.output || []) {
+    for (const content of item.content || []) {
+      if (typeof content.text === "string") return content.text;
+    }
+  }
+  return "";
 }
 
 function normalizeHosts(hosts, baseUrl) {

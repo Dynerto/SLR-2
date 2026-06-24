@@ -121,8 +121,17 @@ async function runJob(workerJobId, payload) {
     features: [],
     optimizations: [],
     risks: [],
-    content_suggestions: []
+    content_suggestions: [],
+    library_video: null,
+    next_crawl_goal: ""
   }));
+  const voiceoverAudioUrl = await synthesizeVoiceover(payload, aiAnalysis, jobDir).catch((error) => {
+    console.error("voiceover failed", error);
+    return "";
+  });
+  if (voiceoverAudioUrl && aiAnalysis.library_video) {
+    aiAnalysis.library_video.voiceoverAudioUrl = voiceoverAudioUrl;
+  }
   const resultPath = path.join(jobDir, "result.json");
   await fs.writeFile(resultPath, JSON.stringify({ summary, script, steps, videoUrl, aiAnalysis }, null, 2), "utf8");
 
@@ -152,8 +161,10 @@ async function login(page, site, steps) {
 async function gotoWithDirectorySlashFallback(page, url) {
   const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
   if (response && response.status() === 403 && !String(url).endsWith("/")) {
-    return page.goto(String(url) + "/", { waitUntil: "domcontentloaded", timeout: 45000 });
+    const retryUrl = String(url) + "/";
+    return page.goto(retryUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
   }
+
   return response;
 }
 
@@ -223,7 +234,7 @@ function buildInstructionScript(payload, steps) {
 
 async function analyzeSiteWithOpenAI(payload, steps, summary) {
   const apiKey = String(payload.ai?.apiKey || process.env.OPENAI_API_KEY || "").trim();
-  const model = String(payload.ai?.model || process.env.OPENAI_MODEL || "gpt-5.4-nano").trim() || "gpt-5.4-nano";
+  const model = String(payload.ai?.contentModel || payload.ai?.model || process.env.OPENAI_MODEL || "gpt-5.5").trim() || "gpt-5.5";
   if (!apiKey) {
     return {
       error: "OpenAI API key not configured",
@@ -232,7 +243,9 @@ async function analyzeSiteWithOpenAI(payload, steps, summary) {
       features: [],
       optimizations: [],
       risks: [],
-      content_suggestions: []
+      content_suggestions: [],
+      library_video: null,
+      next_crawl_goal: ""
     };
   }
 
@@ -254,10 +267,13 @@ async function analyzeSiteWithOpenAI(payload, steps, summary) {
     "Ontdek workflows, gebruiksdoelen, belangrijke functies, optimalisaties, risico's en suggesties voor instructievideo's.",
     "Gebruik Nederlands. Wees concreet en baseer elk item op evidence uit urls, knoppen, formulieren of headings.",
     "Geef uitsluitend geldige JSON terug met exact deze top-level keys:",
-    "workflows, usage_goals, features, optimizations, risks, content_suggestions.",
+    "workflows, usage_goals, features, optimizations, risks, content_suggestions, library_video, next_crawl_goal.",
     "workflow object: title, user_goal, steps array, evidence array, confidence number 0..1.",
     "usage_goals object: title, audience, priority, evidence array.",
     "feature/optimization/risk/content_suggestion object: title, body, evidence array.",
+    "library_video object: title, category, tags array, duration, level, summary, subtitle, voiceover, body.",
+    "Maak library_video geschikt als instructievideo in een academy: korte titel, duidelijke ondertitel, voice-overtekst in spreektaal, en extra tekst met stappen.",
+    "next_crawl_goal is een concreet Nederlandstalig doel voor de volgende crawl, niet langer dan 180 tekens.",
     "",
     JSON.stringify({
       site: payload.site?.name || "site",
@@ -298,8 +314,55 @@ async function analyzeSiteWithOpenAI(payload, steps, summary) {
     features: Array.isArray(parsed.features) ? parsed.features : [],
     optimizations: Array.isArray(parsed.optimizations) ? parsed.optimizations : [],
     risks: Array.isArray(parsed.risks) ? parsed.risks : [],
-    content_suggestions: Array.isArray(parsed.content_suggestions) ? parsed.content_suggestions : []
+    content_suggestions: Array.isArray(parsed.content_suggestions) ? parsed.content_suggestions : [],
+    library_video: parsed.library_video && typeof parsed.library_video === "object" ? normalizeLibraryVideo(parsed.library_video) : null,
+    next_crawl_goal: typeof parsed.next_crawl_goal === "string" ? parsed.next_crawl_goal.slice(0, 300) : ""
   };
+}
+
+function normalizeLibraryVideo(video) {
+  return {
+    title: String(video.title || "Nieuwe instructievideo").trim(),
+    category: String(video.category || "AI instructies").trim(),
+    tags: Array.isArray(video.tags) ? video.tags.map((tag) => String(tag).trim()).filter(Boolean).slice(0, 8) : ["ai", "instructie"],
+    duration: String(video.duration || "").trim(),
+    level: String(video.level || "Basis").trim(),
+    summary: String(video.summary || "").trim(),
+    subtitle: String(video.subtitle || "").trim(),
+    voiceover: String(video.voiceover || "").trim(),
+    voiceoverAudioUrl: "",
+    body: String(video.body || "").trim()
+  };
+}
+
+async function synthesizeVoiceover(payload, aiAnalysis, jobDir) {
+  const apiKey = String(payload.ai?.apiKey || process.env.OPENAI_API_KEY || "").trim();
+  const model = String(payload.ai?.voiceModel || process.env.OPENAI_TTS_MODEL || "gpt-4o-mini-tts").trim();
+  const voiceover = String(aiAnalysis?.library_video?.voiceover || "").trim();
+  if (!apiKey || !model || !voiceover) return "";
+
+  const response = await fetch("https://api.openai.com/v1/audio/speech", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${apiKey}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model,
+      voice: "alloy",
+      input: voiceover.slice(0, 4000),
+      response_format: "mp3"
+    })
+  });
+
+  if (!response.ok) {
+    throw new Error(`OpenAI speech failed ${response.status}: ${await response.text()}`);
+  }
+
+  const bytes = Buffer.from(await response.arrayBuffer());
+  const filename = "voiceover.mp3";
+  await fs.writeFile(path.join(jobDir, filename), bytes);
+  return artifactUrl(payload.jobId, filename);
 }
 
 function extractResponseText(data) {

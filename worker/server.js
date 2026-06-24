@@ -146,6 +146,11 @@ async function runJob(workerJobId, payload) {
 }
 
 async function login(page, site, steps) {
+  if (!String(site.loginUrl || "").trim()) {
+    steps.push({ type: "login_skipped", reason: "No login URL configured" });
+    return;
+  }
+
   await gotoWithDirectorySlashFallback(page, site.loginUrl);
   await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
   steps.push({ type: "login", url: site.loginUrl, title: await page.title().catch(() => "Login") });
@@ -158,7 +163,7 @@ async function login(page, site, steps) {
   const submit = page.locator('button[type="submit"], input[type="submit"], button:has-text("Log in"), button:has-text("Login"), button:has-text("Inloggen")').first();
   if (await submit.count()) {
     await Promise.allSettled([page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 15000 }), submit.click()]);
-  } else {
+  } else if (await pass.count()) {
     await pass.press("Enter").catch(() => {});
     await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
   }

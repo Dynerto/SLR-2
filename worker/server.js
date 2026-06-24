@@ -222,8 +222,8 @@ function buildInstructionScript(payload, steps) {
 }
 
 async function analyzeSiteWithOpenAI(payload, steps, summary) {
-  const apiKey = String(payload.ai?.apiKey || "").trim();
-  const model = String(payload.ai?.model || "gpt-5.4-nano").trim() || "gpt-5.4-nano";
+  const apiKey = String(payload.ai?.apiKey || process.env.OPENAI_API_KEY || "").trim();
+  const model = String(payload.ai?.model || process.env.OPENAI_MODEL || "gpt-5.4-nano").trim() || "gpt-5.4-nano";
   if (!apiKey) {
     return {
       error: "OpenAI API key not configured",

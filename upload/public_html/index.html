@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="nl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0d6b57">
+  <title>Capteer Instruct Academy</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="stylesheet" href="style.css">
+  <script src="academy-data.js" defer></script>
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <main class="academy-shell">
+    <header class="topbar">
+      <a class="brand" href="./" aria-label="Capteer Instruct Academy">
+        <span class="brand-mark">C</span>
+        <span>
+          <strong>Capteer Instruct</strong>
+          <small>Academy</small>
+        </span>
+      </a>
+      <nav aria-label="Hoofdnavigatie" data-i18n-attr="aria-label:mainNavLabel">
+        <a href="./" data-i18n="navLibrary">Bibliotheek</a>
+        <a href="admin/" data-i18n="navAdmin">Admin</a>
+      </nav>
+      <div class="language-toggle" role="group" aria-label="Taal" data-i18n-attr="aria-label:languageLabel">
+        <button type="button" data-lang="nl">NL</button>
+        <button type="button" data-lang="en">EN</button>
+      </div>
+    </header>
+
+    <section class="workspace" aria-label="Instructievideo bibliotheek" data-i18n-attr="aria-label:workspaceLabel">
+      <aside class="library-panel">
+        <div class="library-heading">
+          <h1 data-i18n="libraryTitle">Instructies</h1>
+          <p id="result-count" data-i18n="loadingVideos">Video's laden...</p>
+        </div>
+
+        <label class="search-field">
+          <span data-i18n="searchLabel">Zoeken</span>
+          <input id="search-input" type="search" placeholder="Zoek op onderwerp, tag of tekst" autocomplete="off" data-i18n-attr="placeholder:searchPlaceholder">
+        </label>
+
+        <div class="filter-block">
+          <h2 data-i18n="categoryLabel">Categorie</h2>
+          <div id="category-filters" class="chip-row" aria-label="Categoriefilters" data-i18n-attr="aria-label:categoryFiltersLabel"></div>
+        </div>
+
+        <div class="filter-block">
+          <h2 data-i18n="tagsLabel">Tags</h2>
+          <div id="tag-filters" class="chip-row" aria-label="Tagfilters" data-i18n-attr="aria-label:tagFiltersLabel"></div>
+        </div>
+
+        <div id="video-list" class="video-list" aria-label="Video's" data-i18n-attr="aria-label:videosLabel"></div>
+      </aside>
+
+      <section class="viewer" aria-live="polite">
+        <div class="viewer-copy">
+          <div class="meta-line">
+            <span id="active-category" data-i18n="categoryLabel">Categorie</span>
+            <span id="active-duration" data-i18n="durationLabel">Duur</span>
+            <span id="active-level" data-i18n="levelLabel">Niveau</span>
+          </div>
+          <h2 id="active-title" data-i18n="selectInstruction">Selecteer een instructie</h2>
+          <p id="active-summary" data-i18n="selectInstructionSummary">Kies links een video om de uitleg en stappen te bekijken.</p>
+        </div>
+
+        <div class="media-frame">
+          <video id="active-video" controls playsinline preload="metadata" poster=""></video>
+          <iframe id="active-youtube" title="YouTube video" loading="lazy" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen hidden></iframe>
+        </div>
+
+        <div class="lesson-body">
+          <div>
+            <h3 data-i18n="explanationLabel">Uitleg</h3>
+            <p id="active-body"></p>
+          </div>
+          <div>
+            <h3 data-i18n="tagsLabel">Tags</h3>
+            <div id="active-tags" class="tag-list"></div>
+          </div>
+        </div>
+      </section>
+    </section>
+  </main>
+</body>
+</html>

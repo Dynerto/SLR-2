@@ -66,13 +66,19 @@ async function runJob(workerJobId, payload) {
   const page = await context.newPage();
   const steps = [];
   const visited = new Set();
-  const queue = [payload.site.baseUrl];
+  const queue = [];
   const allowedHosts = normalizeHosts(payload.site.allowedHosts, payload.site.baseUrl);
   const maxPages = clamp(Number(payload.job?.maxPages || 25), 1, 100);
   const allowPurchases = Boolean(payload.site.allowPurchases && payload.job?.allowPurchases);
 
   try {
     await login(page, payload.site, steps);
+    for (const candidate of [page.url(), payload.site.loginUrl, payload.site.baseUrl]) {
+      const absolute = safeUrl(candidate, payload.site.baseUrl);
+      if (absolute && isAllowedUrl(absolute, allowedHosts) && !queue.includes(absolute)) {
+        queue.push(absolute);
+      }
+    }
 
     while (queue.length && visited.size < maxPages) {
       const url = queue.shift();

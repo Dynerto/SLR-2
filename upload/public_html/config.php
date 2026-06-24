@@ -79,4 +79,8 @@ return [
         'url' => rtrim(env_value('CRAWLER_WORKER_URL', ''), '/'),
         'api_token' => env_value('CRAWLER_API_TOKEN', ''),
     ],
+    'openai' => [
+        'api_key' => env_value('OPENAI_API_KEY', ''),
+        'model' => env_value('OPENAI_MODEL', 'gpt-5.4-nano'),
+    ],
 ];

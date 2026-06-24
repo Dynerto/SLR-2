@@ -33,6 +33,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             header('Location: /admin/crawls/?started=' . $jobId);
             exit;
         }
+        if ($action === 'save_ai_settings') {
+            save_ai_settings($_POST);
+            header('Location: /admin/crawls/?saved=ai');
+            exit;
+        }
+        if ($action === 'fetch_openai_models') {
+            fetch_and_store_openai_models($_POST);
+            header('Location: /admin/crawls/?saved=models');
+            exit;
+        }
     } catch (Throwable $exception) {
         $error = $exception->getMessage();
     }
@@ -47,14 +57,36 @@ if (isset($_GET['deleted'])) {
 if (isset($_GET['started'])) {
     $notice = 'Crawljob gestart.';
 }
+if (isset($_GET['saved']) && $_GET['saved'] === 'ai') {
+    $notice = 'AI-instellingen opgeslagen.';
+}
+if (isset($_GET['saved']) && $_GET['saved'] === 'models') {
+    $notice = 'OpenAI-modellen opgehaald.';
+}
 
-$sites = db()->query('SELECT * FROM crawl_sites ORDER BY id DESC')->fetchAll();
-$jobs = db()->query('SELECT j.*, s.name AS site_name FROM crawl_jobs j JOIN crawl_sites s ON s.id = j.site_id ORDER BY j.id DESC LIMIT 50')->fetchAll();
+$sites = [];
+$jobs = [];
+$aiSettings = ['api_key' => '', 'selected_model' => 'gpt-5.4-nano', 'available_models' => []];
+$workflowCount = 0;
+$goalCount = 0;
+$insightCount = 0;
 $editSite = null;
-if (isset($_GET['edit'])) {
-    $stmt = db()->prepare('SELECT * FROM crawl_sites WHERE id = ?');
-    $stmt->execute([(int) $_GET['edit']]);
-    $editSite = $stmt->fetch() ?: null;
+
+try {
+    $sites = db()->query('SELECT * FROM crawl_sites ORDER BY id DESC')->fetchAll();
+    $jobs = db()->query('SELECT j.*, s.name AS site_name FROM crawl_jobs j JOIN crawl_sites s ON s.id = j.site_id ORDER BY j.id DESC LIMIT 50')->fetchAll();
+    $aiSettings = ai_settings();
+    $workflowCount = (int) db()->query('SELECT COUNT(*) FROM crawl_discovered_workflows')->fetchColumn();
+    $goalCount = (int) db()->query('SELECT COUNT(*) FROM crawl_usage_goals')->fetchColumn();
+    $insightCount = (int) db()->query('SELECT COUNT(*) FROM crawl_ai_insights')->fetchColumn();
+
+    if (isset($_GET['edit'])) {
+        $stmt = db()->prepare('SELECT * FROM crawl_sites WHERE id = ?');
+        $stmt->execute([(int) $_GET['edit']]);
+        $editSite = $stmt->fetch() ?: null;
+    }
+} catch (Throwable $exception) {
+    $error = 'Crawlerbeheer kan de database nog niet gebruiken: ' . $exception->getMessage();
 }
 
 function save_site(array $post): void
@@ -144,11 +176,16 @@ function dispatch_job(int $jobId): void
     if (!$row) {
         throw new RuntimeException('Job niet gevonden.');
     }
+    $ai = ai_settings();
 
     $payload = [
         'jobId' => $jobId,
         'callbackUrl' => site_origin() . '/crawler-callback.php',
         'callbackToken' => app_config()['security']['crawler_callback_token'],
+        'ai' => [
+            'apiKey' => $ai['api_key'],
+            'model' => $ai['selected_model'] ?: 'gpt-5.4-nano',
+        ],
         'site' => [
             'name' => $row['name'],
             'baseUrl' => $row['base_url'],
@@ -190,6 +227,73 @@ function dispatch_job(int $jobId): void
     $workerJobId = is_array($data) ? (string) ($data['workerJobId'] ?? '') : '';
     $stmt = db()->prepare('UPDATE crawl_jobs SET status=?, worker_job_id=?, started_at=NOW(), updated_at=NOW() WHERE id=?');
     $stmt->execute(['running', $workerJobId, $jobId]);
+}
+
+function save_ai_settings(array $post): void
+{
+    $model = trim((string) ($post['selected_model'] ?? ''));
+    $apiKey = trim((string) ($post['openai_api_key'] ?? ''));
+    if ($model === '') {
+        $model = 'gpt-5.4-nano';
+    }
+
+    if ($apiKey !== '') {
+        $stmt = db()->prepare('UPDATE ai_settings SET api_key_encrypted=?, selected_model=?, updated_at=NOW() WHERE id=1');
+        $stmt->execute([encrypt_secret($apiKey), $model]);
+        return;
+    }
+
+    $stmt = db()->prepare('UPDATE ai_settings SET selected_model=?, updated_at=NOW() WHERE id=1');
+    $stmt->execute([$model]);
+}
+
+function fetch_and_store_openai_models(array $post): void
+{
+    $apiKey = trim((string) ($post['openai_api_key'] ?? ''));
+    if ($apiKey === '') {
+        $apiKey = ai_settings()['api_key'];
+    }
+    if ($apiKey === '') {
+        throw new RuntimeException('Vul eerst een OpenAI API key in.');
+    }
+
+    $ch = curl_init('https://api.openai.com/v1/models');
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HTTPHEADER => [
+            'Authorization: Bearer ' . $apiKey,
+            'Content-Type: application/json',
+        ],
+        CURLOPT_TIMEOUT => 20,
+    ]);
+    $response = curl_exec($ch);
+    $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $curlError = curl_error($ch);
+    curl_close($ch);
+
+    if ($response === false || $status < 200 || $status >= 300) {
+        throw new RuntimeException('OpenAI-modellen ophalen mislukt: ' . ($curlError ?: (string) $response));
+    }
+
+    $data = json_decode((string) $response, true);
+    $models = [];
+    foreach (($data['data'] ?? []) as $model) {
+        $id = (string) ($model['id'] ?? '');
+        if ($id !== '' && (strpos($id, 'gpt-') === 0 || strpos($id, 'o') === 0)) {
+            $models[] = $id;
+        }
+    }
+    $models[] = 'gpt-5.4-nano';
+    $models = array_values(array_unique($models));
+    sort($models, SORT_NATURAL | SORT_FLAG_CASE);
+
+    $selected = trim((string) ($post['selected_model'] ?? ai_settings()['selected_model']));
+    if ($selected === '') {
+        $selected = 'gpt-5.4-nano';
+    }
+
+    $stmt = db()->prepare('UPDATE ai_settings SET api_key_encrypted=?, selected_model=?, available_models=?, updated_at=NOW() WHERE id=1');
+    $stmt->execute([encrypt_secret($apiKey), $selected, json_encode($models, JSON_UNESCAPED_SLASHES)]);
 }
 
 function short_text(string $value, int $length = 120): string
@@ -251,6 +355,35 @@ function site_origin(): string
       </aside>
 
       <section class="editor-panel">
+        <div class="preview-panel">
+          <h2>OpenAI instellingen</h2>
+          <form class="video-form" method="post" action="/admin/crawls/">
+            <input type="hidden" name="csrf_token" value="<?= e($_SESSION['csrf_token']) ?>">
+            <div class="form-grid">
+              <label>OpenAI API key <input type="password" name="openai_api_key" placeholder="<?= $aiSettings['api_key'] !== '' ? 'Key is opgeslagen' : 'sk-...' ?>"></label>
+              <label>Model
+                <select name="selected_model">
+                  <?php
+                    $models = array_values(array_unique(array_merge(['gpt-5.4-nano'], $aiSettings['available_models'])));
+                    foreach ($models as $model):
+                  ?>
+                    <option value="<?= e($model) ?>" <?= $model === $aiSettings['selected_model'] ? 'selected' : '' ?>><?= e($model) ?></option>
+                  <?php endforeach; ?>
+                </select>
+              </label>
+            </div>
+            <div class="form-actions">
+              <button type="submit" name="action" value="fetch_openai_models">Key opslaan en modellen ophalen</button>
+              <button class="secondary-button" type="submit" name="action" value="save_ai_settings">Model opslaan</button>
+            </div>
+          </form>
+          <p class="video-status">
+            AI <?= $aiSettings['api_key'] !== '' ? 'staat aan' : 'staat nog uit' ?>.
+            Gekozen model: <?= e($aiSettings['selected_model'] ?: 'gpt-5.4-nano') ?>.
+            Opgeslagen: <?= (int) $workflowCount ?> workflows, <?= (int) $goalCount ?> gebruiksdoelen, <?= (int) $insightCount ?> inzichten.
+          </p>
+        </div>
+
         <h2><?= $editSite ? 'Site bewerken' : 'Nieuwe site' ?></h2>
         <form class="video-form" method="post" action="/admin/crawls/">
           <input type="hidden" name="csrf_token" value="<?= e($_SESSION['csrf_token']) ?>">

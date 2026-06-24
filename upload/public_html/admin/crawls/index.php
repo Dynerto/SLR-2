@@ -335,6 +335,13 @@ function site_origin(): string
 
     <?php if ($notice): ?><p class="notice"><?= e($notice) ?></p><?php endif; ?>
     <?php if ($error): ?><p class="error panel-message"><?= e($error) ?></p><?php endif; ?>
+    <?php if (!$error): ?>
+      <p class="notice">
+        AI-status:
+        <?= $aiSettings['api_key'] !== '' ? 'aan' : 'uit' ?><?= $aiSettings['api_key_source'] === 'env' ? ' via .env' : ($aiSettings['api_key_source'] === 'database' ? ' via admin' : '') ?>.
+        Model: <?= e($aiSettings['selected_model'] ?: 'gpt-5.4-nano') ?>.
+      </p>
+    <?php endif; ?>
 
     <section class="manager-grid">
       <aside class="video-admin-list">

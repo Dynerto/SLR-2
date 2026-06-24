@@ -302,10 +302,19 @@ function ai_settings(): array
         $models = is_array($decoded) ? array_values(array_filter(array_map('strval', $decoded))) : [];
     }
 
+    $storedKey = !empty($settings['api_key_encrypted']) ? decrypt_secret((string) $settings['api_key_encrypted']) : '';
+    $envKey = (string) (app_config()['openai']['api_key'] ?? '');
+    $envModel = (string) (app_config()['openai']['model'] ?? 'gpt-5.4-nano');
+    $selectedModel = (string) ($settings['selected_model'] ?? '');
+    if ($selectedModel === '') {
+        $selectedModel = $envModel !== '' ? $envModel : 'gpt-5.4-nano';
+    }
+
     return [
         'api_key_encrypted' => (string) ($settings['api_key_encrypted'] ?? ''),
-        'api_key' => !empty($settings['api_key_encrypted']) ? decrypt_secret((string) $settings['api_key_encrypted']) : '',
-        'selected_model' => (string) ($settings['selected_model'] ?? 'gpt-5.4-nano'),
+        'api_key' => $storedKey !== '' ? $storedKey : $envKey,
+        'api_key_source' => $storedKey !== '' ? 'database' : ($envKey !== '' ? 'env' : ''),
+        'selected_model' => $selectedModel,
         'available_models' => $models,
         'updated_at' => (string) ($settings['updated_at'] ?? ''),
     ];

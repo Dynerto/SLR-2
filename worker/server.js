@@ -131,7 +131,7 @@ async function runJob(workerJobId, payload) {
 }
 
 async function login(page, site, steps) {
-  await page.goto(site.loginUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
+  await gotoWithDirectorySlashFallback(page, site.loginUrl);
   await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
   steps.push({ type: "login", url: site.loginUrl, title: await page.title().catch(() => "Login") });
 
@@ -147,6 +147,14 @@ async function login(page, site, steps) {
     await pass.press("Enter").catch(() => {});
     await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
   }
+}
+
+async function gotoWithDirectorySlashFallback(page, url) {
+  const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
+  if (response && response.status() === 403 && !String(url).endsWith("/")) {
+    return page.goto(String(url) + "/", { waitUntil: "domcontentloaded", timeout: 45000 });
+  }
+  return response;
 }
 
 async function inspectPage(page) {

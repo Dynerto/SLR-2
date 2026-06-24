@@ -56,3 +56,62 @@ CREATE TABLE crawl_jobs (
   INDEX idx_crawl_jobs_status (status),
   CONSTRAINT fk_crawl_jobs_site FOREIGN KEY (site_id) REFERENCES crawl_sites(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE ai_settings (
+  id TINYINT UNSIGNED NOT NULL,
+  api_key_encrypted TEXT NULL,
+  selected_model VARCHAR(120) NOT NULL DEFAULT 'gpt-5.4-nano',
+  available_models MEDIUMTEXT NULL,
+  updated_at DATETIME NOT NULL,
+  PRIMARY KEY (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE crawl_discovered_workflows (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  job_id BIGINT UNSIGNED NOT NULL,
+  site_id BIGINT UNSIGNED NOT NULL,
+  title VARCHAR(255) NOT NULL,
+  user_goal TEXT NULL,
+  steps_json MEDIUMTEXT NULL,
+  evidence_json MEDIUMTEXT NULL,
+  confidence DECIMAL(4,3) NULL,
+  created_at DATETIME NOT NULL,
+  PRIMARY KEY (id),
+  INDEX idx_crawl_workflows_job_id (job_id),
+  INDEX idx_crawl_workflows_site_id (site_id),
+  CONSTRAINT fk_crawl_workflows_job FOREIGN KEY (job_id) REFERENCES crawl_jobs(id) ON DELETE CASCADE,
+  CONSTRAINT fk_crawl_workflows_site FOREIGN KEY (site_id) REFERENCES crawl_sites(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE crawl_usage_goals (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  job_id BIGINT UNSIGNED NOT NULL,
+  site_id BIGINT UNSIGNED NOT NULL,
+  title VARCHAR(255) NOT NULL,
+  audience VARCHAR(255) NULL,
+  priority VARCHAR(40) NULL,
+  evidence_json MEDIUMTEXT NULL,
+  created_at DATETIME NOT NULL,
+  PRIMARY KEY (id),
+  INDEX idx_crawl_goals_job_id (job_id),
+  INDEX idx_crawl_goals_site_id (site_id),
+  CONSTRAINT fk_crawl_goals_job FOREIGN KEY (job_id) REFERENCES crawl_jobs(id) ON DELETE CASCADE,
+  CONSTRAINT fk_crawl_goals_site FOREIGN KEY (site_id) REFERENCES crawl_sites(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE crawl_ai_insights (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  job_id BIGINT UNSIGNED NOT NULL,
+  site_id BIGINT UNSIGNED NOT NULL,
+  insight_type VARCHAR(60) NOT NULL,
+  title VARCHAR(255) NOT NULL,
+  body MEDIUMTEXT NULL,
+  evidence_json MEDIUMTEXT NULL,
+  created_at DATETIME NOT NULL,
+  PRIMARY KEY (id),
+  INDEX idx_crawl_insights_job_id (job_id),
+  INDEX idx_crawl_insights_site_id (site_id),
+  INDEX idx_crawl_insights_type (insight_type),
+  CONSTRAINT fk_crawl_insights_job FOREIGN KEY (job_id) REFERENCES crawl_jobs(id) ON DELETE CASCADE,
+  CONSTRAINT fk_crawl_insights_site FOREIGN KEY (site_id) REFERENCES crawl_sites(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

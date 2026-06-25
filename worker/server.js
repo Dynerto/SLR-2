@@ -11,12 +11,18 @@ const publicBaseUrl = (process.env.PUBLIC_BASE_URL || "").replace(/\/$/, "");
 const artifactsDir = path.resolve("artifacts");
 const jobs = new Map();
 const jobTimeoutMs = Number(process.env.CRAWLER_JOB_TIMEOUT_MS || 20 * 60 * 1000);
+const WORKER_VERSION = "2026-06-25.4-diagnostics";
+const DEFAULT_USER_AGENT = process.env.CRAWLER_USER_AGENT || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
 app.use(express.json({ limit: "2mb" }));
 app.use("/artifacts", express.static(artifactsDir));
 
 app.get("/health", (req, res) => {
-  res.json({ ok: true, jobs: jobs.size });
+  res.json({ ok: true, version: WORKER_VERSION, jobs: jobs.size, publicBaseUrl, artifactsDir });
+});
+
+app.get("/version", (req, res) => {
+  res.json({ ok: true, version: WORKER_VERSION });
 });
 
 app.post("/jobs", requireToken, async (req, res) => {
@@ -27,11 +33,18 @@ app.post("/jobs", requireToken, async (req, res) => {
 
   const workerJobId = crypto.randomUUID();
   jobs.set(workerJobId, { status: "queued", site: payload.site?.name || "unknown", createdAt: new Date().toISOString() });
-  res.status(202).json({ ok: true, workerJobId });
+  res.status(202).json({ ok: true, workerJobId, workerVersion: WORKER_VERSION });
 
   runJobWithTimeout(workerJobId, payload).catch(async (error) => {
+    const failure = await writeFailureArtifact(payload, error);
     jobs.set(workerJobId, { status: "failed", error: String(error?.stack || error) });
-    await postCallback(payload, { status: "failed", error: String(error?.message || error) });
+    await postCallback(payload, {
+      status: "failed",
+      error: String(error?.message || error),
+      artifactUrl: failure.artifactUrl,
+      workerVersion: WORKER_VERSION,
+      diagnostics: failure.diagnostics
+    });
   });
 });
 
@@ -75,17 +88,63 @@ async function runJobWithTimeout(workerJobId, payload) {
 }
 
 async function runJob(workerJobId, payload) {
-  jobs.set(workerJobId, { status: "running", site: payload.site.name, startedAt: new Date().toISOString() });
+  const diagnostics = createDiagnostics(payload, workerJobId);
+  addDiagnostic(diagnostics, "job_started", {
+    site: payload.site?.name || "",
+    baseUrl: payload.site?.baseUrl || "",
+    maxPages: payload.job?.maxPages || 25
+  });
+  jobs.set(workerJobId, { status: "running", site: payload.site.name, startedAt: new Date().toISOString(), version: WORKER_VERSION });
   await fs.mkdir(artifactsDir, { recursive: true });
   const jobDir = path.join(artifactsDir, String(payload.jobId));
   await fs.mkdir(jobDir, { recursive: true });
 
-  const browser = await chromium.launch({ headless: true });
+  const browser = await chromium.launch({
+    headless: true,
+    args: [
+      "--disable-blink-features=AutomationControlled",
+      "--disable-dev-shm-usage",
+      "--no-sandbox"
+    ]
+  });
   const context = await browser.newContext({
     viewport: { width: 1440, height: 1000 },
+    userAgent: DEFAULT_USER_AGENT,
+    locale: "nl-NL",
+    timezoneId: "Europe/Amsterdam",
+    ignoreHTTPSErrors: true,
+    colorScheme: "light",
+    extraHTTPHeaders: {
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "Accept-Language": "nl-NL,nl;q=0.9,en-US;q=0.8,en;q=0.7",
+      "DNT": "1",
+      "Upgrade-Insecure-Requests": "1"
+    },
     recordVideo: { dir: jobDir, size: { width: 1440, height: 1000 } }
   });
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+  });
   const page = await context.newPage();
+  page.on("response", (response) => {
+    const request = response.request();
+    if (request.resourceType() === "document") {
+      addDiagnostic(diagnostics, "document_response", {
+        url: response.url(),
+        status: response.status(),
+        server: response.headers()["server"] || "",
+        contentType: response.headers()["content-type"] || ""
+      });
+    }
+  });
+  page.on("requestfailed", (request) => {
+    addDiagnostic(diagnostics, "request_failed", {
+      url: request.url(),
+      method: request.method(),
+      resourceType: request.resourceType(),
+      errorText: request.failure()?.errorText || ""
+    });
+  });
   const steps = [];
   const visited = new Set();
   const queue = [];
@@ -95,7 +154,7 @@ async function runJob(workerJobId, payload) {
 
   try {
     await login(page, payload.site, steps);
-    for (const candidate of [page.url(), payload.site.loginUrl, payload.site.baseUrl]) {
+    for (const candidate of buildStartUrls(payload.site)) {
       const absolute = safeUrl(candidate, payload.site.baseUrl);
       if (absolute && isAllowedUrl(absolute, allowedHosts) && !queue.includes(absolute)) {
         queue.push(absolute);
@@ -106,27 +165,53 @@ async function runJob(workerJobId, payload) {
       const url = queue.shift();
       if (!url || visited.has(url) || !isAllowedUrl(url, allowedHosts)) continue;
 
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
+      addDiagnostic(diagnostics, "navigate_start", { url });
+      const response = await gotoPage(page, url);
       await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
-      visited.add(url);
+      const finalUrl = normalizeUrlForVisit(page.url() || url);
+      visited.add(finalUrl || url);
 
       const pageInfo = await inspectPage(page);
+      pageInfo.status = response?.status() || 0;
+      pageInfo.finalUrl = page.url() || url;
+      pageInfo.accessProblem = detectAccessProblem(pageInfo);
       const screenshotName = `${String(visited.size).padStart(3, "0")}.png`;
       await page.screenshot({ path: path.join(jobDir, screenshotName), fullPage: true }).catch(() => {});
+      addDiagnostic(diagnostics, "page_inspected", {
+        url,
+        finalUrl: pageInfo.finalUrl,
+        status: pageInfo.status,
+        title: pageInfo.title,
+        accessProblem: pageInfo.accessProblem,
+        headings: pageInfo.headings.length,
+        links: pageInfo.links.length,
+        buttons: pageInfo.buttons.length,
+        forms: pageInfo.forms.length,
+        screenshot: artifactUrl(payload.jobId, screenshotName)
+      });
       steps.push({
         type: "page",
         url,
+        finalUrl: pageInfo.finalUrl,
+        status: pageInfo.status,
+        accessProblem: pageInfo.accessProblem,
         title: pageInfo.title,
         headings: pageInfo.headings,
         screenshot: artifactUrl(payload.jobId, screenshotName),
         buttons: pageInfo.buttons,
         forms: pageInfo.forms,
+        metaDescription: pageInfo.metaDescription,
         textSample: pageInfo.textSample
       });
 
+      if (pageInfo.accessProblem) {
+        continue;
+      }
+
       for (const link of pageInfo.links) {
         const absolute = safeUrl(link, url);
-        if (absolute && isAllowedUrl(absolute, allowedHosts) && !visited.has(absolute) && queue.length < maxPages * 3) {
+        const normalized = normalizeUrlForVisit(absolute);
+        if (absolute && isAllowedUrl(absolute, allowedHosts) && !visited.has(normalized) && queue.length < maxPages * 4) {
           queue.push(absolute);
         }
       }
@@ -142,17 +227,39 @@ async function runJob(workerJobId, payload) {
   const videoUrl = videoPath ? artifactUrl(payload.jobId, path.basename(videoPath)) : "";
   const script = buildInstructionScript(payload, steps);
   const summary = buildSummary(payload, steps, visited.size, allowPurchases);
-  const aiAnalysis = await analyzeSiteWithOpenAI(payload, steps, summary).catch((error) => ({
-    error: String(error?.message || error),
-    workflows: [],
-    usage_goals: [],
-    features: [],
-    optimizations: [],
-    risks: [],
-    content_suggestions: [],
-    library_video: null,
-    next_crawl_goal: ""
-  }));
+  const usablePages = steps.filter((step) => step.type === "page" && !step.accessProblem);
+  const crawlStatus = usablePages.length ? "completed" : "failed";
+  const crawlError = usablePages.length ? "" : "Crawler zag geen bruikbare pagina's. Er wordt geen video gepubliceerd.";
+  addDiagnostic(diagnostics, "job_result", {
+    status: crawlStatus,
+    pages: visited.size,
+    usablePages: usablePages.length,
+    error: crawlError,
+    videoUrl
+  });
+  const aiAnalysis = usablePages.length
+    ? await analyzeSiteWithOpenAI(payload, steps, summary).catch((error) => ({
+        error: String(error?.message || error),
+        workflows: [],
+        usage_goals: [],
+        features: [],
+        optimizations: [],
+        risks: [],
+        content_suggestions: [],
+        library_video: null,
+        next_crawl_goal: ""
+      }))
+    : {
+      error: "Crawler zag geen bruikbare pagina's; AI-generatie overgeslagen.",
+      workflows: [],
+      usage_goals: [],
+      features: [],
+      optimizations: [],
+      risks: [],
+      content_suggestions: [],
+      library_video: null,
+      next_crawl_goal: ""
+    };
   const voiceoverAudioUrl = await synthesizeVoiceover(payload, aiAnalysis, jobDir).catch((error) => {
     console.error("voiceover failed", error);
     return "";
@@ -161,15 +268,36 @@ async function runJob(workerJobId, payload) {
     aiAnalysis.library_video.voiceoverAudioUrl = voiceoverAudioUrl;
   }
   const resultPath = path.join(jobDir, "result.json");
-  await fs.writeFile(resultPath, JSON.stringify({ summary, script, steps, videoUrl, aiAnalysis }, null, 2), "utf8");
+  const diagnosticsPath = path.join(jobDir, "diagnostics.json");
+  await fs.writeFile(diagnosticsPath, JSON.stringify(diagnostics, null, 2), "utf8");
+  await fs.writeFile(resultPath, JSON.stringify({
+    workerVersion: WORKER_VERSION,
+    summary,
+    script,
+    steps,
+    videoUrl,
+    aiAnalysis,
+    diagnosticsUrl: artifactUrl(payload.jobId, "diagnostics.json")
+  }, null, 2), "utf8");
 
   const current = jobs.get(workerJobId);
   if (current && current.status !== "running") {
     return;
   }
 
-  jobs.set(workerJobId, { status: "completed", site: payload.site.name, finishedAt: new Date().toISOString(), pages: visited.size, videoUrl });
-  await postCallback(payload, { status: "completed", summary, script, videoUrl, artifactUrl: artifactUrl(payload.jobId, "result.json"), aiAnalysis });
+  jobs.set(workerJobId, { status: crawlStatus, site: payload.site.name, finishedAt: new Date().toISOString(), pages: visited.size, videoUrl, error: crawlError, version: WORKER_VERSION });
+  await postCallback(payload, {
+    status: crawlStatus,
+    error: crawlError,
+    summary,
+    script,
+    videoUrl,
+    artifactUrl: artifactUrl(payload.jobId, "result.json"),
+    workerVersion: WORKER_VERSION,
+    diagnostics,
+    diagnosticsUrl: artifactUrl(payload.jobId, "diagnostics.json"),
+    aiAnalysis
+  });
 }
 
 async function login(page, site, steps) {
@@ -178,7 +306,7 @@ async function login(page, site, steps) {
     return;
   }
 
-  await gotoWithDirectorySlashFallback(page, site.loginUrl);
+  await gotoPage(page, site.loginUrl);
   await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
   steps.push({ type: "login", url: site.loginUrl, title: await page.title().catch(() => "Login") });
 
@@ -194,6 +322,15 @@ async function login(page, site, steps) {
     await pass.press("Enter").catch(() => {});
     await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
   }
+}
+
+async function gotoPage(page, url) {
+  let response = await gotoWithDirectorySlashFallback(page, url);
+  if (response && response.status() === 403 && String(url).startsWith("https://")) {
+    const httpUrl = "http://" + String(url).replace(/^https:\/\//i, "");
+    response = await gotoWithDirectorySlashFallback(page, httpUrl).catch(() => response);
+  }
+  return response;
 }
 
 async function gotoWithDirectorySlashFallback(page, url) {
@@ -218,7 +355,9 @@ async function inspectPage(page) {
         action: form.action || location.href,
         labels: Array.from(form.querySelectorAll("label, input, select, textarea")).map((el) => el.getAttribute("aria-label") || el.getAttribute("name") || visibleText(el)).filter(Boolean).slice(0, 30)
       })).slice(0, 10),
-      textSample: visibleText(document.body).slice(0, 1200)
+      textSample: visibleText(document.body).slice(0, 1200),
+      canonical: document.querySelector('link[rel="canonical"]')?.href || "",
+      metaDescription: document.querySelector('meta[name="description"]')?.content || ""
     };
   });
 }
@@ -253,7 +392,11 @@ async function postCallback(payload, result) {
 }
 
 function buildSummary(payload, steps, pages, allowPurchases) {
-  return `${payload.site.name}: ${pages} pagina's bezocht. ${steps.filter((step) => step.type === "action_candidate").length} mogelijke functies gevonden. Aankoopmodus: ${allowPurchases ? "aan" : "uit"}.`;
+  const pageSteps = steps.filter((step) => step.type === "page");
+  const blocked = pageSteps.filter((step) => step.accessProblem).length;
+  const usable = pageSteps.length - blocked;
+  const suffix = blocked ? ` ${blocked} pagina('s) geblokkeerd.` : "";
+  return `${payload.site.name}: ${pages} pagina's bezocht, ${usable} bruikbaar. ${steps.filter((step) => step.type === "action_candidate").length} mogelijke functies gevonden. Aankoopmodus: ${allowPurchases ? "aan" : "uit"}.${suffix}`;
 }
 
 function buildInstructionScript(payload, steps) {
@@ -294,10 +437,14 @@ async function analyzeSiteWithOpenAI(payload, steps, summary) {
     .map((step) => ({
       url: step.url,
       title: step.title,
+      status: step.status || 0,
+      finalUrl: step.finalUrl || "",
+      accessProblem: step.accessProblem || "",
       headings: step.headings || [],
       buttons: step.buttons || [],
       forms: step.forms || [],
       screenshot: step.screenshot || "",
+      metaDescription: step.metaDescription || "",
       textSample: step.textSample || ""
     }));
 
@@ -373,6 +520,134 @@ function normalizeLibraryVideo(video) {
     voiceoverAudioUrl: "",
     body: String(video.body || "").trim()
   };
+}
+
+function createDiagnostics(payload, workerJobId) {
+  return {
+    workerVersion: WORKER_VERSION,
+    workerJobId,
+    jobId: payload.jobId || "",
+    createdAt: new Date().toISOString(),
+    runtime: {
+      node: process.version,
+      platform: process.platform,
+      publicBaseUrl,
+      userAgent: DEFAULT_USER_AGENT
+    },
+    events: []
+  };
+}
+
+function addDiagnostic(diagnostics, type, data = {}) {
+  if (!diagnostics || !Array.isArray(diagnostics.events)) return;
+  diagnostics.events.push({
+    at: new Date().toISOString(),
+    type,
+    ...redactDiagnosticData(data)
+  });
+  if (diagnostics.events.length > 250) {
+    diagnostics.events.splice(0, diagnostics.events.length - 250);
+  }
+}
+
+function redactDiagnosticData(data) {
+  const redacted = {};
+  for (const [key, value] of Object.entries(data || {})) {
+    if (/password|token|secret|key/i.test(key)) {
+      redacted[key] = "[redacted]";
+    } else {
+      redacted[key] = value;
+    }
+  }
+  return redacted;
+}
+
+async function writeFailureArtifact(payload, error) {
+  const jobId = payload?.jobId || "unknown";
+  const jobDir = path.join(artifactsDir, String(jobId));
+  const diagnostics = createDiagnostics(payload || {}, "");
+  addDiagnostic(diagnostics, "worker_failure", {
+    error: String(error?.message || error),
+    stack: String(error?.stack || "")
+  });
+  await fs.mkdir(jobDir, { recursive: true }).catch(() => {});
+  const result = {
+    workerVersion: WORKER_VERSION,
+    summary: "",
+    script: "",
+    steps: [],
+    videoUrl: "",
+    aiAnalysis: {
+      error: String(error?.message || error),
+      workflows: [],
+      usage_goals: [],
+      features: [],
+      optimizations: [],
+      risks: [],
+      content_suggestions: [],
+      library_video: null,
+      next_crawl_goal: ""
+    },
+    diagnosticsUrl: artifactUrl(jobId, "diagnostics.json")
+  };
+  await fs.writeFile(path.join(jobDir, "diagnostics.json"), JSON.stringify(diagnostics, null, 2), "utf8").catch(() => {});
+  await fs.writeFile(path.join(jobDir, "result.json"), JSON.stringify(result, null, 2), "utf8").catch(() => {});
+  return {
+    artifactUrl: artifactUrl(jobId, "result.json"),
+    diagnostics
+  };
+}
+
+function buildStartUrls(site) {
+  const baseUrl = String(site.baseUrl || "").trim();
+  const loginUrl = String(site.loginUrl || "").trim();
+  const urls = [];
+  const add = (value) => {
+    const absolute = safeUrl(value, baseUrl);
+    if (absolute && !urls.includes(absolute)) urls.push(absolute);
+  };
+
+  add(baseUrl);
+  if (baseUrl && !baseUrl.endsWith("/")) add(baseUrl + "/");
+  if (loginUrl) add(loginUrl);
+
+  return urls;
+}
+
+function normalizeUrlForVisit(url) {
+  try {
+    const parsed = new URL(url);
+    parsed.hash = "";
+    return parsed.href.replace(/\/$/, "");
+  } catch {
+    return String(url || "").replace(/\/$/, "");
+  }
+}
+
+function detectAccessProblem(pageInfo) {
+  const status = Number(pageInfo?.status || 0);
+  const haystack = [
+    pageInfo?.title || "",
+    pageInfo?.textSample || "",
+    ...(Array.isArray(pageInfo?.headings) ? pageInfo.headings : [])
+  ].join(" ").toLowerCase();
+
+  if ([401, 403, 429, 503].includes(status)) {
+    return `HTTP ${status}`;
+  }
+  if (
+    haystack.includes("403 - forbidden") ||
+    haystack.includes("access to this page is forbidden") ||
+    haystack.includes("forbidden") ||
+    haystack.includes("access denied") ||
+    haystack.includes("blocked by") ||
+    haystack.includes("enable cookies") ||
+    haystack.includes("checking your browser")
+  ) {
+    return "Access denied content";
+  }
+
+  return "";
 }
 
 async function synthesizeVoiceover(payload, aiAnalysis, jobDir) {

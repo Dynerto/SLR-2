@@ -10,8 +10,13 @@ const apiToken = process.env.CRAWLER_API_TOKEN || "";
 const publicBaseUrl = (process.env.PUBLIC_BASE_URL || "").replace(/\/$/, "");
 const artifactsDir = path.resolve("artifacts");
 const jobs = new Map();
-const jobTimeoutMs = Number(process.env.CRAWLER_JOB_TIMEOUT_MS || 20 * 60 * 1000);
-const WORKER_VERSION = "2026-06-25.4-diagnostics";
+const activeBrowsers = new Map();
+const jobTimeoutMs = Number(process.env.CRAWLER_JOB_TIMEOUT_MS || 6 * 60 * 1000);
+const pageGotoTimeoutMs = Number(process.env.CRAWLER_PAGE_TIMEOUT_MS || 20000);
+const pageIdleTimeoutMs = Number(process.env.CRAWLER_IDLE_TIMEOUT_MS || 2500);
+const progressCallbackIntervalMs = Number(process.env.CRAWLER_PROGRESS_CALLBACK_MS || 5000);
+const maxEffectivePages = Number(process.env.CRAWLER_MAX_EFFECTIVE_PAGES || 10);
+const WORKER_VERSION = "2026-06-25.5-progress-timebox";
 const DEFAULT_USER_AGENT = process.env.CRAWLER_USER_AGENT || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
 app.use(express.json({ limit: "2mb" }));
@@ -67,9 +72,15 @@ function requireToken(req, res, next) {
 }
 
 async function runJobWithTimeout(workerJobId, payload) {
+  const controller = new AbortController();
   let timeoutId;
   const timeout = new Promise((_, reject) => {
     timeoutId = setTimeout(() => {
+      controller.abort();
+      const browser = activeBrowsers.get(workerJobId);
+      if (browser) {
+        browser.close().catch(() => {});
+      }
       jobs.set(workerJobId, {
         status: "timed_out",
         site: payload.site?.name || "unknown",
@@ -81,13 +92,13 @@ async function runJobWithTimeout(workerJobId, payload) {
   });
 
   try {
-    await Promise.race([runJob(workerJobId, payload), timeout]);
+    await Promise.race([runJob(workerJobId, payload, controller.signal), timeout]);
   } finally {
     clearTimeout(timeoutId);
   }
 }
 
-async function runJob(workerJobId, payload) {
+async function runJob(workerJobId, payload, abortSignal) {
   const diagnostics = createDiagnostics(payload, workerJobId);
   addDiagnostic(diagnostics, "job_started", {
     site: payload.site?.name || "",
@@ -107,6 +118,7 @@ async function runJob(workerJobId, payload) {
       "--no-sandbox"
     ]
   });
+  activeBrowsers.set(workerJobId, browser);
   const context = await browser.newContext({
     viewport: { width: 1440, height: 1000 },
     userAgent: DEFAULT_USER_AGENT,
@@ -121,6 +133,14 @@ async function runJob(workerJobId, payload) {
       "Upgrade-Insecure-Requests": "1"
     },
     recordVideo: { dir: jobDir, size: { width: 1440, height: 1000 } }
+  });
+  await context.route("**/*", async (route) => {
+    const type = route.request().resourceType();
+    if (["font", "media"].includes(type)) {
+      await route.abort().catch(() => {});
+      return;
+    }
+    await route.continue().catch(() => {});
   });
   await context.addInitScript(() => {
     Object.defineProperty(navigator, "webdriver", { get: () => undefined });
@@ -149,8 +169,10 @@ async function runJob(workerJobId, payload) {
   const visited = new Set();
   const queue = [];
   const allowedHosts = normalizeHosts(payload.site.allowedHosts, payload.site.baseUrl);
-  const maxPages = clamp(Number(payload.job?.maxPages || 25), 1, 100);
+  const requestedMaxPages = clamp(Number(payload.job?.maxPages || 25), 1, 100);
+  const maxPages = clamp(Math.min(requestedMaxPages, maxEffectivePages), 1, 100);
   const allowPurchases = Boolean(payload.site.allowPurchases && payload.job?.allowPurchases);
+  let lastProgressCallbackAt = 0;
 
   try {
     await login(page, payload.site, steps);
@@ -162,12 +184,15 @@ async function runJob(workerJobId, payload) {
     }
 
     while (queue.length && visited.size < maxPages) {
+      if (abortSignal?.aborted) {
+        throw new Error("Worker timeout: crawl afgebroken door tijdslimiet.");
+      }
       const url = queue.shift();
       if (!url || visited.has(url) || !isAllowedUrl(url, allowedHosts)) continue;
 
       addDiagnostic(diagnostics, "navigate_start", { url });
       const response = await gotoPage(page, url);
-      await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
+      await page.waitForLoadState("networkidle", { timeout: pageIdleTimeoutMs }).catch(() => {});
       const finalUrl = normalizeUrlForVisit(page.url() || url);
       visited.add(finalUrl || url);
 
@@ -205,22 +230,25 @@ async function runJob(workerJobId, payload) {
       });
 
       if (pageInfo.accessProblem) {
+        lastProgressCallbackAt = await maybePostProgress(payload, diagnostics, steps, visited, allowPurchases, lastProgressCallbackAt);
         continue;
       }
 
       for (const link of pageInfo.links) {
         const absolute = safeUrl(link, url);
         const normalized = normalizeUrlForVisit(absolute);
-        if (absolute && isAllowedUrl(absolute, allowedHosts) && !visited.has(normalized) && queue.length < maxPages * 4) {
+        if (shouldQueueUrl(absolute, allowedHosts, visited, queue) && !visited.has(normalized) && queue.length < maxPages * 3) {
           queue.push(absolute);
         }
       }
 
       await safeExploreClicks(page, steps, allowPurchases);
+      lastProgressCallbackAt = await maybePostProgress(payload, diagnostics, steps, visited, allowPurchases, lastProgressCallbackAt);
     }
   } finally {
-    await context.close();
-    await browser.close();
+    activeBrowsers.delete(workerJobId);
+    await context.close().catch(() => {});
+    await browser.close().catch(() => {});
   }
 
   const videoPath = await findNewestVideo(jobDir);
@@ -267,18 +295,14 @@ async function runJob(workerJobId, payload) {
   if (voiceoverAudioUrl && aiAnalysis.library_video) {
     aiAnalysis.library_video.voiceoverAudioUrl = voiceoverAudioUrl;
   }
-  const resultPath = path.join(jobDir, "result.json");
-  const diagnosticsPath = path.join(jobDir, "diagnostics.json");
-  await fs.writeFile(diagnosticsPath, JSON.stringify(diagnostics, null, 2), "utf8");
-  await fs.writeFile(resultPath, JSON.stringify({
-    workerVersion: WORKER_VERSION,
+  await writeResultArtifact(payload, {
     summary,
     script,
     steps,
     videoUrl,
     aiAnalysis,
-    diagnosticsUrl: artifactUrl(payload.jobId, "diagnostics.json")
-  }, null, 2), "utf8");
+    diagnostics
+  });
 
   const current = jobs.get(workerJobId);
   if (current && current.status !== "running") {
@@ -307,7 +331,7 @@ async function login(page, site, steps) {
   }
 
   await gotoPage(page, site.loginUrl);
-  await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
+  await page.waitForLoadState("networkidle", { timeout: pageIdleTimeoutMs }).catch(() => {});
   steps.push({ type: "login", url: site.loginUrl, title: await page.title().catch(() => "Login") });
 
   const user = page.locator('input[type="email"], input[name*="email" i], input[name*="user" i], input[type="text"]').first();
@@ -317,10 +341,10 @@ async function login(page, site, steps) {
 
   const submit = page.locator('button[type="submit"], input[type="submit"], button:has-text("Log in"), button:has-text("Login"), button:has-text("Inloggen")').first();
   if (await submit.count()) {
-    await Promise.allSettled([page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 15000 }), submit.click()]);
+    await Promise.allSettled([page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: pageGotoTimeoutMs }), submit.click()]);
   } else if (await pass.count()) {
     await pass.press("Enter").catch(() => {});
-    await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
+    await page.waitForLoadState("networkidle", { timeout: pageIdleTimeoutMs }).catch(() => {});
   }
 }
 
@@ -334,10 +358,10 @@ async function gotoPage(page, url) {
 }
 
 async function gotoWithDirectorySlashFallback(page, url) {
-  const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
+  const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout: pageGotoTimeoutMs });
   if (response && response.status() === 403 && !String(url).endsWith("/")) {
     const retryUrl = String(url) + "/";
-    return page.goto(retryUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
+    return page.goto(retryUrl, { waitUntil: "domcontentloaded", timeout: pageGotoTimeoutMs });
   }
 
   return response;
@@ -389,6 +413,61 @@ async function postCallback(payload, result) {
     body: JSON.stringify({ jobId: payload.jobId, ...result }),
     signal: timeoutSignal(30000)
   }).catch((error) => console.error("callback failed", error));
+}
+
+async function maybePostProgress(payload, diagnostics, steps, visited, allowPurchases, lastProgressCallbackAt) {
+  const now = Date.now();
+  if (now - lastProgressCallbackAt < progressCallbackIntervalMs) {
+    return lastProgressCallbackAt;
+  }
+
+  const summary = buildSummary(payload, steps, visited.size, allowPurchases);
+  const script = buildInstructionScript(payload, steps);
+  await writeResultArtifact(payload, {
+    summary,
+    script,
+    steps,
+    videoUrl: "",
+    aiAnalysis: {
+      error: "Crawl loopt nog; AI-analyse volgt na afronding.",
+      workflows: [],
+      usage_goals: [],
+      features: [],
+      optimizations: [],
+      risks: [],
+      content_suggestions: [],
+      library_video: null,
+      next_crawl_goal: ""
+    },
+    diagnostics
+  });
+  await postCallback(payload, {
+    status: "running",
+    error: "",
+    summary,
+    script,
+    videoUrl: "",
+    artifactUrl: artifactUrl(payload.jobId, "result.json"),
+    workerVersion: WORKER_VERSION,
+    diagnostics,
+    diagnosticsUrl: artifactUrl(payload.jobId, "diagnostics.json")
+  });
+  return now;
+}
+
+async function writeResultArtifact(payload, result) {
+  const jobDir = path.join(artifactsDir, String(payload.jobId));
+  await fs.mkdir(jobDir, { recursive: true });
+  await fs.writeFile(path.join(jobDir, "diagnostics.json"), JSON.stringify(result.diagnostics || {}, null, 2), "utf8");
+  await fs.writeFile(path.join(jobDir, "result.json"), JSON.stringify({
+    workerVersion: WORKER_VERSION,
+    summary: result.summary || "",
+    script: result.script || "",
+    steps: result.steps || [],
+    videoUrl: result.videoUrl || "",
+    aiAnalysis: result.aiAnalysis || null,
+    diagnosticsUrl: artifactUrl(payload.jobId, "diagnostics.json")
+  }, null, 2), "utf8");
 }
 
 function buildSummary(payload, steps, pages, allowPurchases) {
@@ -614,10 +693,39 @@ function buildStartUrls(site) {
   return urls;
 }
 
+function shouldQueueUrl(url, allowedHosts, visited, queue) {
+  if (!url || !isAllowedUrl(url, allowedHosts)) return false;
+  const normalized = normalizeUrlForVisit(url);
+  if (visited.has(normalized) || queue.some((item) => normalizeUrlForVisit(item) === normalized)) return false;
+
+  try {
+    const parsed = new URL(url);
+    const path = parsed.pathname.toLowerCase();
+    const query = parsed.search.toLowerCase();
+    if (/\.(pdf|zip|rar|7z|jpg|jpeg|png|gif|webp|svg|mp4|mov|webm|mp3|wav|css|js|ico|woff|woff2|ttf)$/i.test(path)) {
+      return false;
+    }
+    if (path.includes("/wp-admin") || path.includes("/feed") || path.includes("/cart") || path.includes("/checkout")) {
+      return false;
+    }
+    if (query.includes("add-to-cart") || query.includes("remove_item") || query.includes("logout") || query.includes("replytocom")) {
+      return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function normalizeUrlForVisit(url) {
   try {
     const parsed = new URL(url);
     parsed.hash = "";
+    for (const key of Array.from(parsed.searchParams.keys())) {
+      if (/^(utm_|fbclid|gclid|mc_|pk_)/i.test(key)) {
+        parsed.searchParams.delete(key);
+      }
+    }
     return parsed.href.replace(/\/$/, "");
   } catch {
     return String(url || "").replace(/\/$/, "");
